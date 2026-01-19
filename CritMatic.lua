@@ -10,7 +10,12 @@ Critmatic = LibStub("AceAddon-3.0"):NewAddon(CritMaticGold .. "CritMatic|r", "Ac
         "AceComm-3.0")
 local L = LibStub("AceLocale-3.0"):GetLocale("CritMatic")
 
-local MAX_HIT = 40000
+--
+-- Upper bound filter for recorded hit/crit/heal values.
+-- The original 40,000 cap can cause higher-value crits/hits (common on later clients/gear)
+-- to be ignored, which then makes tooltips appear to have missing values.
+--
+local MAX_HIT = 2000000
 
 local function GetGCD()
     local _, gcdDuration = GetSpellCooldown(78) -- 78 is the spell ID for Warrior's Heroic Strike
@@ -33,132 +38,137 @@ local function IsSpellInSpellbook(spellName)
     return false
 end
 
-local spellDataAggregate = {}
+--
+-- Tooltip injection
+--
+-- NOTE: The original implementation attempted to aggregate *all* spells and inject
+-- inside the aggregation loop. That makes the tooltip lines unstable (values can be
+-- partially aggregated when we insert) and commonly causes clipping/blank right-side
+-- values depending on when the tooltip clamps.
+--
 
-local function AddHighestHitsToTooltip(self, slot, isSpellBook)
-    if (not slot) then
+local function CritMatic_GetAggregatedByName(spellName)
+    if not spellName or not CritMaticData then
+        return 0, 0, 0, 0
+    end
+
+    local highestCrit, highestNormal, highestHealCrit, highestHeal = 0, 0, 0, 0
+    for sID, data in pairs(CritMaticData) do
+        local sName = GetSpellInfo(sID)
+        if sName == spellName and data then
+            highestCrit = math.max(highestCrit, data.highestCrit or 0)
+            highestNormal = math.max(highestNormal, data.highestNormal or 0)
+            highestHealCrit = math.max(highestHealCrit, data.highestHealCrit or 0)
+            highestHeal = math.max(highestHeal, data.highestHeal or 0)
+        end
+    end
+
+    return highestCrit, highestNormal, highestHealCrit, highestHeal
+end
+
+local function CritMatic_AddSpellLinesToTooltip(tip, spellID)
+    if not tip or not tip.NumLines or not spellID then return end
+    local spellName = GetSpellInfo(spellID)
+    if not spellName then return end
+
+    local highestCrit, highestNormal, highestHealCrit, highestHeal = CritMatic_GetAggregatedByName(spellName)
+    if highestCrit <= 0 and highestNormal <= 0 and highestHealCrit <= 0 and highestHeal <= 0 then
         return
     end
-    local actionType, id, spellID
 
+    local cooldown = (GetSpellBaseCooldown(spellID) or 0) / 1000
+    local _, _, _, castTime = GetSpellInfo(spellID)
+    local effectiveCastTime = (castTime and castTime > 0) and (castTime / 1000) or GetGCD()
+    local effectiveTime = max(effectiveCastTime, cooldown)
+    if not effectiveTime or effectiveTime <= 0 then
+        effectiveTime = 1
+    end
+
+    local critDPS = highestCrit / effectiveTime
+    local normalDPS = highestNormal / effectiveTime
+    local critHPS = highestHealCrit / effectiveTime
+    local normalHPS = highestHeal / effectiveTime
+
+    local CritMaticLeft = L["action_bar_crit"] .. ": "
+    local normalMaticLeft = L["action_bar_hit"] .. ": "
+    local CritMaticHealLeft = L["action_bar_crit_heal"] .. ": "
+    local normalMaticHealLeft = L["action_bar_heal"] .. ": "
+
+    local DPS = L["action_bar_dps"] .. ") "
+    local HPS = L["action_bar_hps"] .. ") "
+
+    local CritMaticRight = tostring(highestCrit) .. " (" .. format("%.1f", critDPS) .. DPS
+    local normalMaticRight = tostring(highestNormal) .. " (" .. format("%.1f", normalDPS) .. DPS
+    local CritMaticHealRight = tostring(highestHealCrit) .. " (" .. format("%.1f", critHPS) .. HPS
+    local normalMaticHealRight = tostring(highestHeal) .. " (" .. format("%.1f", normalHPS) .. HPS
+
+    -- Prevent duplicates (works for GameTooltip and custom tooltip frames)
+    local tipName = (tip and tip.GetName and tip:GetName()) or "GameTooltip"
+    local critMaticHealExists, normalMaticHealExists, critMaticExists, normalMaticExists = false, false, false, false
+    for i = 1, tip:NumLines() do
+        local gtl = _G[tipName .. "TextLeft" .. i]
+        local gtr = _G[tipName .. "TextRight" .. i]
+        if gtl and gtr then
+            local lt, rt = gtl:GetText(), gtr:GetText()
+            if lt == CritMaticHealLeft and rt == CritMaticHealRight then
+                critMaticHealExists = true
+            elseif lt == normalMaticHealLeft and rt == normalMaticHealRight then
+                normalMaticHealExists = true
+            elseif lt == CritMaticLeft and rt == CritMaticRight then
+                critMaticExists = true
+            elseif lt == normalMaticLeft and rt == normalMaticRight then
+                normalMaticExists = true
+            end
+        end
+    end
+
+    -- Damage (Crit above Hit)
+    if highestCrit > 0 and not critMaticExists then
+        tip:AddDoubleLine(CritMaticLeft, CritMaticRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0)
+    end
+    if highestNormal > 0 and not normalMaticExists then
+        tip:AddDoubleLine(normalMaticLeft, normalMaticRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0)
+    end
+
+    -- Healing
+    if highestHealCrit > 0 and not critMaticHealExists then
+        tip:AddDoubleLine(CritMaticHealLeft, CritMaticHealRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0)
+    end
+    if highestHeal > 0 and not normalMaticHealExists then
+        tip:AddDoubleLine(normalMaticHealLeft, normalMaticHealRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0)
+    end
+
+    -- Nudge the tooltip to recalc width/clamp after we add right-justified text.
+    -- (Show is safe; avoids Hide/Show which can break tooltip ownership.)
+    if tip.Show then tip:Show() end
+end
+
+local function AddHighestHitsToTooltip(self, slot, isSpellBook)
+    if not self or not slot then return end
+
+    local actionType, id, spellID
     if isSpellBook then
-        -- Handle spellbook item
         spellID = select(3, GetSpellBookItemName(slot, BOOKTYPE_SPELL))
         actionType = "spell"
     else
-        -- Handle action bar item
         actionType, id = GetActionInfo(slot)
         if actionType == "spell" then
             spellID = id
         end
     end
-    local localizedSpellName = GetSpellInfo(spellID)
-    -- Initialize an empty table for aggregating data by spell name
 
-    -- Loop over all spells in CritMaticData to aggregate data by spell name
-    for sID, data in pairs(CritMaticData) do
-        local sName = GetSpellInfo(sID)
+    if actionType ~= "spell" or not spellID then return end
 
-        if sName then
-            -- Initialize the sub-table for each spell name if it doesn't exist
-            if not spellDataAggregate[sName] then
-                spellDataAggregate[sName] = {
-                    highestCrit = 0,
-                    highestNormal = 0,
-                    highestHealCrit = 0,
-                    highestHeal = 0,
-                }
+    -- Defer by 0 so we run after the tooltip is fully populated for this frame.
+    if _G.C_Timer and _G.C_Timer.After then
+        local tip = self
+        C_Timer.After(0, function()
+            if tip and tip.IsShown and tip:IsShown() then
+                CritMatic_AddSpellLinesToTooltip(tip, spellID)
             end
-
-            -- Now aggregate the data
-            spellDataAggregate[sName].highestCrit = math.max(spellDataAggregate[sName].highestCrit, data.highestCrit or 0)
-            spellDataAggregate[sName].highestNormal = math.max(spellDataAggregate[sName].highestNormal, data.highestNormal or 0)
-            spellDataAggregate[sName].highestHealCrit = math.max(spellDataAggregate[sName].highestHealCrit, data.highestHealCrit or 0)
-            spellDataAggregate[sName].highestHeal = math.max(spellDataAggregate[sName].highestHeal, data.highestHeal or 0)
-        end
-
-        if actionType == "spell" and spellID then
-            if spellDataAggregate[localizedSpellName] then
-
-                local cooldown = (GetSpellBaseCooldown(spellID) or 0) / 1000
-                local _, _, _, castTime = GetSpellInfo(spellID)
-                local effectiveCastTime = castTime > 0 and (castTime / 1000) or GetGCD()
-                local effectiveTime = max(effectiveCastTime, cooldown)
-
-                local critDPS = spellDataAggregate[localizedSpellName].highestCrit / effectiveTime
-                local normalDPS = spellDataAggregate[localizedSpellName].highestNormal / effectiveTime
-                local critHPS = spellDataAggregate[localizedSpellName].highestHealCrit / effectiveTime
-                local normalHPS = spellDataAggregate[localizedSpellName].highestHeal / effectiveTime
-
-                local CritMaticLeft = L["action_bar_crit"] .. ": "
-                local DPS = L["action_bar_dps"] .. ") "
-                local CritMaticRight = tostring(spellDataAggregate[localizedSpellName].highestCrit) .. " (" .. format("%.1f",
-                        critDPS) .. DPS
-                local normalMaticLeft = L["action_bar_hit"] .. ": "
-                local normalMaticRight = tostring(spellDataAggregate[localizedSpellName].highestNormal) .. " (" .. format("%.1f", normalDPS) .. DPS
-
-                local CritMaticHealLeft = L["action_bar_crit_heal"] .. ": "
-                local HPS = L["action_bar_hps"] .. ") "
-                local CritMaticHealRight = tostring(spellDataAggregate[localizedSpellName].highestHealCrit) .. " (" .. format("%.1f", critHPS) .. HPS
-                local normalMaticHealLeft = L["action_bar_heal"] .. ": "
-                local normalMaticHealRight = tostring(spellDataAggregate[localizedSpellName].highestHeal) .. " (" .. format("%.1f", normalHPS) .. HPS
-
-                -- Check if lines are already present in the tooltip.
-                local critMaticHealExists = false
-                local normalMaticHealExists = false
-                local critMaticExists = false
-                local normalMaticExists = false
-
-                for i = 1, self:NumLines() do
-                    local gtl = _G["GameTooltipTextLeft" .. i]
-                    local gtr = _G["GameTooltipTextRight" .. i]
-
-                    if gtl and gtr then
-                        -- Healing related
-                        if gtl:GetText() == CritMaticHealLeft and gtr:GetText() == CritMaticHealRight then
-                            critMaticHealExists = true
-                        elseif gtl:GetText() == normalMaticHealLeft and gtr:GetText() == normalMaticHealRight then
-                            normalMaticHealExists = true
-                        end
-                        -- Damage related
-                        if gtl:GetText() == CritMaticLeft and gtr:GetText() == CritMaticRight then
-                            critMaticExists = true
-                        elseif gtl:GetText() == normalMaticLeft and gtr:GetText() == normalMaticRight then
-                            normalMaticExists = true
-                        end
-                    end
-                end
-
-                -- This is a damaging spell
-                if spellDataAggregate[localizedSpellName].highestCrit > 0 then
-                    if not critMaticExists then
-                        self:AddDoubleLine(CritMaticLeft, CritMaticRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0) -- left side color (white) right side color (gold)
-                    end
-                end
-
-                if spellDataAggregate[localizedSpellName].highestNormal > 0 then
-
-                    if not normalMaticExists then
-                        self:AddDoubleLine(normalMaticLeft, normalMaticRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0)-- left side color (white) right side color (gold)
-                    end
-                end
-
-                if spellDataAggregate[localizedSpellName].highestHealCrit > 0 then
-                    if not critMaticHealExists then
-                        self:AddDoubleLine(CritMaticHealLeft, CritMaticHealRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0) -- left side color (white)  right side color (gold)
-                    end
-                end
-
-                if spellDataAggregate[localizedSpellName].highestHeal > 0 then
-
-                    if not normalMaticHealExists then
-                        self:AddDoubleLine(normalMaticHealLeft, normalMaticHealRight, 0.9, 0.9, 0.9, 0.9, 0.82, 0) -- left side color (white) right side color (gold)
-                    end
-                end
-            end
-            -- Removed self:Show() - causes conflict with StatWeightsClassic
-            -- The tooltip is already shown by the game after hook completes
-        end
+        end)
+    else
+        CritMatic_AddSpellLinesToTooltip(self, spellID)
     end
 end
 -- Function to create a new frame based on the template
@@ -519,9 +529,31 @@ function Critmatic:OnInitialize()
     Critmatic:RegisterEvent("GROUP_ROSTER_UPDATE", "BroadcastVersion")
     -- Function to handle incoming messages
 
-    hooksecurefunc(GameTooltip, "SetAction", AddHighestHitsToTooltip)
-    local GameTooltip = _IsAddOnLoaded("ElvUI") and _G.ElvUISpellBookTooltip or _G.GameTooltip
-    hooksecurefunc(GameTooltip, "SetSpellBookItem", AddHighestHitsToTooltip)
+    -- Tooltip injection: prefer OnTooltipSetSpell so the tooltip sizes/clamps correctly
+    -- (reduces clipping of the right-side values). Keep SetAction/SetSpellBookItem as
+    -- fallbacks for clients/UIs that don't reliably fire OnTooltipSetSpell.
+
+    local function HookTooltip(tip)
+        if not tip or tip.__CritMaticTooltipHooked then return end
+        tip.__CritMaticTooltipHooked = true
+
+        tip:HookScript("OnTooltipSetSpell", function(t)
+            local _, _, sid = t:GetSpell()
+            if sid then
+                CritMatic_AddSpellLinesToTooltip(t, sid)
+            end
+        end)
+
+        hooksecurefunc(tip, "SetAction", AddHighestHitsToTooltip)
+        hooksecurefunc(tip, "SetSpellBookItem", function(t, slot)
+            AddHighestHitsToTooltip(t, slot, true)
+        end)
+    end
+
+    HookTooltip(_G.GameTooltip)
+    if _IsAddOnLoaded("ElvUI") and _G.ElvUISpellBookTooltip then
+        HookTooltip(_G.ElvUISpellBookTooltip)
+    end
 
     function Critmatic:CritMaticLoaded()
         self:Print(CritMaticGray .. " " .. L["version_string"] .. "|r" .. CritMaticWhite .. " " .. version .. "|r " .. CritMaticGray .. L["critmatic_loaded"] .. CritMaticGoldYellow .. "  /cm" .. "|r" .. CritMaticGray .. " " .. L["critmatic_loaded_for_options"] .. "|r " .. CritMaticGoldYellow .. L["critmatic_loaded_cmhelp"] .. "|r " .. CritMaticGray .. L["critmatic_loaded_for_all_slash_commands"] .. "|r ")

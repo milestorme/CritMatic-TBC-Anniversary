@@ -1,9 +1,0 @@
-enable-toc-creation: yes
-#changelog-title: ""
-manual-changelog:
-  filename: ./CHANGE_LOG.md
-  markup-type: markdown
-
-locale:
-  enUS.lua: ./Localization/enUS.lua
-
